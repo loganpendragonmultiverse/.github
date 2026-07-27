@@ -15,7 +15,11 @@ DATA_DIR = ROOT / "monitoring-data"
 
 def gh_json(arguments: list[str]) -> Any:
     completed = subprocess.run(
-        ["gh", "api", *arguments], capture_output=True, text=True, check=False, encoding="utf-8"
+        ["gh", "api", *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+        encoding="utf-8",
     )
     if completed.returncode:
         raise RuntimeError(completed.stderr.strip() or "GitHub CLI request failed")
@@ -23,7 +27,72 @@ def gh_json(arguments: list[str]) -> Any:
 
 
 def public_repositories() -> list[dict[str, Any]]:
-    return gh_json([f"orgs/{ORGANIZATION}/repos?type=public&per_page=100&sort=full_name"])
+    pages = gh_json(
+        [
+            f"orgs/{ORGANIZATION}/repos?type=public&per_page=100&sort=full_name",
+            "--paginate",
+            "--slurp",
+        ]
+    )
+    return [repository for page in pages for repository in page]
+
+
+def repository_subscription(repository: dict[str, Any]) -> tuple[str, dict[str, bool]]:
+    name = str(repository["name"])
+    subscription = gh_json([f"repos/{ORGANIZATION}/{name}/subscription"])
+    return name, {
+        "subscribed": bool(subscription.get("subscribed")),
+        "ignored": bool(subscription.get("ignored")),
+    }
+
+
+def watch_audit(repositories: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    if repositories is None:
+        repositories = public_repositories()
+    statuses: dict[str, dict[str, bool]] = {}
+    failures = []
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        futures = {
+            executor.submit(repository_subscription, repository): repository["name"]
+            for repository in repositories
+        }
+        for future in as_completed(futures):
+            try:
+                name, status = future.result()
+                statuses[name] = status
+            except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                failures.append({"repository": futures[future], "error": str(exc)})
+    gaps = sorted(
+        name
+        for name, status in statuses.items()
+        if not status["subscribed"] or status["ignored"]
+    )
+    return {
+        "repository_count": len(repositories),
+        "watched_count": len(statuses) - len(gaps),
+        "gaps": gaps,
+        "failures": sorted(failures, key=lambda item: item["repository"]),
+    }
+
+
+def reconcile_watches() -> dict[str, Any]:
+    repositories = public_repositories()
+    audit = watch_audit(repositories)
+    names = set(audit["gaps"])
+    names.update(item["repository"] for item in audit["failures"])
+    for name in sorted(names):
+        gh_json(
+            [
+                "--method",
+                "PUT",
+                f"repos/{ORGANIZATION}/{name}/subscription",
+                "-F",
+                "subscribed=true",
+                "-F",
+                "ignored=false",
+            ]
+        )
+    return watch_audit(repositories)
 
 
 def repository_metrics(repository: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -43,7 +112,10 @@ def repository_metrics(repository: dict[str, Any]) -> tuple[str, dict[str, Any]]
         "forks": int(repository.get("forks_count", 0)),
         "open_issues_and_prs": int(repository.get("open_issues_count", 0)),
         "views_14d": {"count": int(views["count"]), "uniques": int(views["uniques"])},
-        "clones_14d": {"count": int(clones["count"]), "uniques": int(clones["uniques"])},
+        "clones_14d": {
+            "count": int(clones["count"]),
+            "uniques": int(clones["uniques"]),
+        },
         "release_asset_downloads": downloads,
     }
 
@@ -57,10 +129,18 @@ def recent_pull_requests(since: str) -> list[dict[str, Any]]:
             if item["createdAt"][:10] < since:
                 continue
             pull_requests.append(
-                {"id": item["id"], "number": item["number"], "title": item["title"],
-                 "url": item["url"], "repository": repository["name"],
-                 "created_at": item["createdAt"], "state": item["state"],
-                 "author": item["author"]["login"] if item["author"] else "deleted-user"}
+                {
+                    "id": item["id"],
+                    "number": item["number"],
+                    "title": item["title"],
+                    "url": item["url"],
+                    "repository": repository["name"],
+                    "created_at": item["createdAt"],
+                    "state": item["state"],
+                    "author": item["author"]["login"]
+                    if item["author"]
+                    else "deleted-user",
+                }
             )
     return sorted(pull_requests, key=lambda item: item["created_at"], reverse=True)
 
@@ -72,10 +152,17 @@ def recent_discussions() -> list[dict[str, Any]]:
     for repository in result["data"]["organization"]["repositories"]["nodes"]:
         for item in repository["discussions"]["nodes"]:
             discussions.append(
-                {"id": item["id"], "number": item["number"], "title": item["title"],
-                 "url": item["url"], "repository": repository["name"],
-                 "created_at": item["createdAt"],
-                 "author": item["author"]["login"] if item["author"] else "deleted-user"}
+                {
+                    "id": item["id"],
+                    "number": item["number"],
+                    "title": item["title"],
+                    "url": item["url"],
+                    "repository": repository["name"],
+                    "created_at": item["createdAt"],
+                    "author": item["author"]["login"]
+                    if item["author"]
+                    else "deleted-user",
+                }
             )
     return sorted(discussions, key=lambda item: item["created_at"], reverse=True)
 
@@ -86,7 +173,10 @@ def capture(data_dir: Path = DATA_DIR) -> Path:
     metrics: dict[str, dict[str, Any]] = {}
     failures = []
     with ThreadPoolExecutor(max_workers=12) as executor:
-        futures = {executor.submit(repository_metrics, repository): repository["name"] for repository in repositories}
+        futures = {
+            executor.submit(repository_metrics, repository): repository["name"]
+            for repository in repositories
+        }
         for future in as_completed(futures):
             try:
                 name, values = future.result()
@@ -94,28 +184,45 @@ def capture(data_dir: Path = DATA_DIR) -> Path:
             except (KeyError, RuntimeError, TypeError, ValueError) as exc:
                 failures.append({"repository": futures[future], "error": str(exc)})
     snapshot = {
-        "schema_version": 1, "organization": ORGANIZATION, "captured_at": now.isoformat(),
-        "repository_count": len(repositories), "repositories": dict(sorted(metrics.items())),
-        "pull_requests": recent_pull_requests((now - timedelta(days=14)).date().isoformat()),
-        "discussions": recent_discussions(), "failures": failures,
+        "schema_version": 1,
+        "organization": ORGANIZATION,
+        "captured_at": now.isoformat(),
+        "repository_count": len(repositories),
+        "repositories": dict(sorted(metrics.items())),
+        "pull_requests": recent_pull_requests(
+            (now - timedelta(days=14)).date().isoformat()
+        ),
+        "discussions": recent_discussions(),
+        "failures": failures,
     }
     data_dir.mkdir(parents=True, exist_ok=True)
     path = data_dir / f"{now.date().isoformat()}.json"
-    path.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
     return path
 
 
 def snapshots(data_dir: Path = DATA_DIR) -> list[dict[str, Any]]:
-    return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(data_dir.glob("*.json"))]
+    return [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(data_dir.glob("*.json"))
+    ]
 
 
-def new_activity(current: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+def new_activity(
+    current: dict[str, Any], previous: dict[str, Any] | None
+) -> dict[str, list[dict[str, Any]]]:
     previous = previous or {"pull_requests": [], "discussions": []}
     old_prs = {item["id"] for item in previous["pull_requests"]}
     old_discussions = {item["id"] for item in previous["discussions"]}
     return {
-        "pull_requests": [item for item in current["pull_requests"] if item["id"] not in old_prs],
-        "discussions": [item for item in current["discussions"] if item["id"] not in old_discussions],
+        "pull_requests": [
+            item for item in current["pull_requests"] if item["id"] not in old_prs
+        ],
+        "discussions": [
+            item for item in current["discussions"] if item["id"] not in old_discussions
+        ],
     }
 
 
@@ -128,32 +235,87 @@ def build_digest(history: list[dict[str, Any]]) -> str:
     rows = []
     for name, values in current["repositories"].items():
         old = baseline["repositories"].get(name, {})
-        rows.append((values["views_14d"]["count"], name, values,
-                     values["release_asset_downloads"] - int(old.get("release_asset_downloads", 0)),
-                     values["stars"] - int(old.get("stars", 0))))
+        rows.append(
+            (
+                values["views_14d"]["count"],
+                name,
+                values,
+                values["release_asset_downloads"]
+                - int(old.get("release_asset_downloads", 0)),
+                values["stars"] - int(old.get("stars", 0)),
+            )
+        )
     rows.sort(reverse=True)
-    lines = ["# Logan Pendragon Multiverse Open-Source Digest", "",
-             f"Captured: {current['captured_at']} - Repositories: {current['repository_count']}", "",
-             f"New pull requests: **{len(activity['pull_requests'])}** - New discussions: **{len(activity['discussions'])}**", "",
-             "Traffic and clone totals are aggregate GitHub signals and can include automation or CI; they do not identify individual users.", "",
-             "## Most Viewed (rolling 14 days)", "", "| Repository | Views | Unique visitors | Clones | Downloads change | Stars change |", "|---|---:|---:|---:|---:|---:|"]
+    lines = [
+        "# Logan Pendragon Multiverse Open-Source Digest",
+        "",
+        f"Captured: {current['captured_at']} - Repositories: {current['repository_count']}",
+        "",
+        f"New pull requests: **{len(activity['pull_requests'])}** - New discussions: **{len(activity['discussions'])}**",
+        "",
+        "Traffic and clone totals are aggregate GitHub signals and can include automation or CI; they do not identify individual users.",
+        "",
+        "## Most Viewed (rolling 14 days)",
+        "",
+        "| Repository | Views | Unique visitors | Clones | Downloads change | Stars change |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
     for _, name, values, downloads_delta, stars_delta in rows[:15]:
-        lines.append(f"| {name} | {values['views_14d']['count']} | {values['views_14d']['uniques']} | {values['clones_14d']['count']} | {downloads_delta:+d} | {stars_delta:+d} |")
-    for title, key in (("New Pull Requests", "pull_requests"), ("New Discussions", "discussions")):
+        lines.append(
+            f"| {name} | {values['views_14d']['count']} | {values['views_14d']['uniques']} | {values['clones_14d']['count']} | {downloads_delta:+d} | {stars_delta:+d} |"
+        )
+    for title, key in (
+        ("New Pull Requests", "pull_requests"),
+        ("New Discussions", "discussions"),
+    ):
         lines.extend(["", f"## {title}", ""])
         items = activity[key]
-        lines.extend([f"- [{item['repository']} #{item.get('number', '')}: {item['title']}]({item['url']}) by @{item['author']}" for item in items] or ["- None."])
+        lines.extend(
+            [
+                f"- [{item['repository']} #{item.get('number', '')}: {item['title']}]({item['url']}) by @{item['author']}"
+                for item in items
+            ]
+            or ["- None."]
+        )
     if current["failures"]:
         lines.extend(["", "## Collection Warnings", ""])
-        lines.extend(f"- {item['repository']}: {item['error']}" for item in current["failures"])
+        lines.extend(
+            f"- {item['repository']}: {item['error']}" for item in current["failures"]
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Retain organization-wide GitHub activity and usage signals.")
-    parser.add_argument("command", choices=("capture", "digest", "capture-and-digest"))
+    parser = argparse.ArgumentParser(
+        description="Manually inspect organization-wide GitHub activity, usage, and watch coverage."
+    )
+    parser.add_argument(
+        "command",
+        choices=(
+            "audit-watches",
+            "reconcile-watches",
+            "capture",
+            "digest",
+            "capture-and-digest",
+        ),
+    )
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     args = parser.parse_args()
+    if args.command in {"audit-watches", "reconcile-watches"}:
+        audit = (
+            reconcile_watches()
+            if args.command == "reconcile-watches"
+            else watch_audit()
+        )
+        print(
+            f"GitHub watch coverage: {audit['watched_count']}/"
+            f"{audit['repository_count']} public repositories"
+        )
+        for name in audit["gaps"]:
+            print(f"WATCH GAP: {name}")
+        for failure in audit["failures"]:
+            print(f"WATCH ERROR: {failure['repository']}: {failure['error']}")
+        return 1 if audit["gaps"] or audit["failures"] else 0
     if args.command in {"capture", "capture-and-digest"}:
         print(capture(args.data_dir))
     if args.command in {"digest", "capture-and-digest"}:
